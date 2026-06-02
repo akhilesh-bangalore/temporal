@@ -12,12 +12,14 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   sync_latest_release:
     runs-on: ubuntu-latest
     outputs:
       latest_tag: ${{ steps.find_tag.outputs.latest_tag }}
+      skipped: ${{ steps.check_sync.outputs.skipped }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -36,6 +38,7 @@ jobs:
             git remote add upstream https://github.com/temporalio/temporal.git
           fi
           git fetch upstream --tags
+          git fetch origin --tags
 
       - name: Find latest release tag
         id: find_tag
@@ -51,36 +54,111 @@ jobs:
           echo "📦 Latest release tag: $LATEST_TAG"
           echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
 
-      - name: Reset main branch to latest tag
+      - name: Check if already synced
+        id: check_sync
         run: |
           LATEST_TAG="${{ steps.find_tag.outputs.latest_tag }}"
           
-          echo "Resetting main branch to tag $LATEST_TAG..."
+          # Check if latest-release branch exists and points to the same tag
+          if git show-ref --verify --quiet "refs/remotes/origin/latest-release"; then
+            CURRENT_SHA=$(git rev-parse origin/latest-release)
+            TAG_SHA=$(git rev-parse "$LATEST_TAG^{commit}")
+            
+            if [ "$CURRENT_SHA" = "$TAG_SHA" ]; then
+              echo "✅ latest-release already points to $LATEST_TAG - skipping sync"
+              echo "skipped=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
           
-          # Backup avalara workflow
-          cp .github/workflows/avalara-release.yml /tmp/avalara-release.yml || true
+          echo "🔄 Sync needed: updating latest-release to $LATEST_TAG"
+          echo "skipped=false" >> $GITHUB_OUTPUT
+
+      - name: Create latest-release branch from tag
+        if: steps.check_sync.outputs.skipped != 'true'
+        run: |
+          LATEST_TAG="${{ steps.find_tag.outputs.latest_tag }}"
+          
+          echo "Creating latest-release branch from tag $LATEST_TAG..."
           
           # Reset to the tag
-          git checkout -B main "$LATEST_TAG"
-          
-          # Remove all workflows and actions
-          rm -rf .github/workflows/*.yml .github/workflows/*.yaml .github/actions || true
-          
-          # Restore only avalara workflow
-          mkdir -p .github/workflows
-          cp /tmp/avalara-release.yml .github/workflows/avalara-release.yml
-          
-          git add -A .github/
-          git commit -m "sync: reset main to $LATEST_TAG (avalara workflow only)" || true
+          git checkout -B latest-release "$LATEST_TAG"
           
           # Force push
-          git push origin main --force
+          git push origin latest-release --force
         env:
           GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
 
-  verify_sync:
+  cancel_triggered_workflows:
     runs-on: ubuntu-latest
     needs: [sync_latest_release]
+    if: needs.sync_latest_release.outputs.skipped != 'true'
+    steps:
+      - name: Wait for workflows to be triggered
+        run: sleep 30
+
+      - name: Cancel non-avalara workflows
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SYNC_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const currentRunId = context.runId;
+            
+            console.log(`Current run ID: ${currentRunId}`);
+            console.log('Fetching in-progress workflow runs...');
+            
+            // Get all in-progress and queued runs
+            const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
+              owner,
+              repo,
+              status: 'in_progress',
+              per_page: 100
+            });
+            
+            const { data: queuedRuns } = await github.rest.actions.listWorkflowRunsForRepo({
+              owner,
+              repo,
+              status: 'queued',
+              per_page: 100
+            });
+            
+            const allRuns = [...runs.workflow_runs, ...queuedRuns.workflow_runs];
+            
+            for (const run of allRuns) {
+              // Skip our own workflow
+              if (run.id === currentRunId) {
+                console.log(`Skipping current run: ${run.name} (${run.id})`);
+                continue;
+              }
+              
+              // Skip if it's the Avalara Release Sync workflow
+              if (run.name === 'Avalara Release Sync') {
+                console.log(`Skipping Avalara workflow: ${run.name} (${run.id})`);
+                continue;
+              }
+              
+              // Cancel any other workflow
+              console.log(`Cancelling: ${run.name} (${run.id}) on branch ${run.head_branch}`);
+              try {
+                await github.rest.actions.cancelWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: run.id
+                });
+                console.log(`  ✅ Cancelled successfully`);
+              } catch (error) {
+                console.log(`  ⚠️ Could not cancel: ${error.message}`);
+              }
+            }
+            
+            console.log('Done cancelling workflows');
+
+  verify_sync:
+    runs-on: ubuntu-latest
+    needs: [sync_latest_release, cancel_triggered_workflows]
+    if: needs.sync_latest_release.outputs.skipped != 'true'
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -94,34 +172,25 @@ jobs:
             git remote add upstream https://github.com/temporalio/temporal.git
           fi
           git fetch upstream --tags
-          git fetch origin main
+          git fetch origin latest-release
 
-      - name: Verify main matches tag (except workflows)
+      - name: Verify latest-release matches tag
         run: |
           LATEST_TAG="${{ needs.sync_latest_release.outputs.latest_tag }}"
           
           echo "=== SYNC VERIFICATION ==="
-          echo "Verifying main branch matches tag $LATEST_TAG"
           
-          # Compare trees excluding .github
-          git diff --name-only "$LATEST_TAG" origin/main -- ':!.github' > /tmp/diff.txt
+          BRANCH_SHA=$(git rev-parse origin/latest-release)
+          TAG_SHA=$(git rev-parse "$LATEST_TAG^{commit}")
           
-          if [ -s /tmp/diff.txt ]; then
-            echo "❌ Files differ (excluding .github):"
-            cat /tmp/diff.txt
+          echo "📝 latest-release commit: $BRANCH_SHA"
+          echo "📝 tag $LATEST_TAG commit: $TAG_SHA"
+          
+          if [ "$BRANCH_SHA" = "$TAG_SHA" ]; then
+            echo "✅ latest-release matches $LATEST_TAG"
+            echo ""
+            echo "🎉 Sync complete!"
+          else
+            echo "❌ Mismatch detected"
             exit 1
-          else
-            echo "✅ Main branch content matches $LATEST_TAG (excluding .github)"
           fi
-          
-          # Verify only avalara-release.yml exists in workflows
-          WORKFLOW_COUNT=$(git ls-tree origin/main .github/workflows/ | wc -l)
-          if [ "$WORKFLOW_COUNT" -eq 1 ]; then
-            echo "✅ Only avalara-release.yml in workflows"
-          else
-            echo "⚠️  Found $WORKFLOW_COUNT files in .github/workflows/"
-            git ls-tree origin/main .github/workflows/
-          fi
-          
-          echo ""
-          echo "🎉 Sync verified: main = $LATEST_TAG + avalara-release.yml"
